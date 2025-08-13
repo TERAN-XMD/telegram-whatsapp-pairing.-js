@@ -1,0 +1,195 @@
+// telegram-whatsapp-pairing.js
+require('dotenv').config();
+
+const { Telegraf } = require('telegraf');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+const axios = require('axios');
+const fs = require('fs-extra');
+const path = require('path');
+const crypto = require('crypto');
+
+const TELEGRAM_BOT_TOKEN = process.env.8392366699:AAFcjWOy9294CD-8oJ76HVc5-aUZutD-keI;
+const ENCRYPTION_SECRET = process.env.oY7@JkP9#fTrLmW2pVxQzC1bEgHuNaSd
+;
+
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error('Missing TELEGRAM_BOT_TOKEN in .env');
+  process.exit(1);
+}
+if (!ENCRYPTION_SECRET || ENCRYPTION_SECRET.length < 32) {
+  console.error('ENCRYPTION_SECRET missing/too short. Use a long random string (32+ chars).');
+  process.exit(1);
+}
+
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+const SESSIONS_DIR = path.join(__dirname, 'user_sessions');
+
+// ---------- Crypto helpers (AES-256-GCM with PBKDF2 key derivation) ----------
+function encryptSessionData(sessionObject, secret) {
+  const plaintext = JSON.stringify(sessionObject); // full set of session files
+
+  const salt = crypto.randomBytes(16);   // for PBKDF2
+  const iv = crypto.randomBytes(12);     // AES-GCM recommended 12-byte IV
+  const key = crypto.pbkdf2Sync(secret, salt, 100000, 32, 'sha256');
+
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  // We upload this JSON blob to Hastebin
+  const payload = {
+    v: 1,
+    alg: 'AES-256-GCM',
+    kdf: 'PBKDF2-SHA256',
+    iters: 100000,
+    // salt/iv/tag are public; secrecy comes from ENCRYPTION_SECRET kept on your server
+    salt_b64: salt.toString('base64'),
+    iv_b64: iv.toString('base64'),
+    tag_b64: tag.toString('base64'),
+    ct_b64: ciphertext.toString('base64')
+  };
+
+  return JSON.stringify(payload);
+}
+
+// ---------- Hastebin upload (now uploads encrypted payload only) ----------
+async function uploadEncryptedToHastebin(encryptedPayload) {
+  const res = await axios.post('https://hastebin.com/documents', encryptedPayload, {
+    headers: { 'Content-Type': 'text/plain' }
+  });
+  if (!res.data || !res.data.key) throw new Error('Hastebin upload failed');
+  // Return an opaque session id. The actual encrypted data (with salt/iv/tag) lives in Hastebin.
+  // Decryption requires your ENCRYPTION_SECRET; possessing the key alone is useless.
+  return `xastral~${res.data.key}`;
+}
+
+// ---------- Telegram bot ----------
+bot.start(ctx => ctx.reply('Welcome! Send /pair to generate a WhatsApp pairing code (valid for 5 minutes).'));
+bot.help(ctx => ctx.reply('Commands:\n/pair - Generate a pairing code\n/logout - Remove your saved session'));
+
+bot.command('pair', async ctx => {
+  const tgId = ctx.from.id;
+  const sessionFolder = path.join(SESSIONS_DIR, tgId.toString());
+  await fs.ensureDir(sessionFolder);
+
+  await ctx.reply('Preparing WhatsApp pairing code. Please wait...');
+
+  // Baileys auth state per Telegram user
+  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+  const { version } = await fetchLatestBaileysVersion();
+
+  // Create a new WA socket instance
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    syncFullHistory: false,
+    emitOwnEvents: false
+  });
+
+  let paired = false;
+  let expireTimer;
+
+  // Request a pairing code immediately (no QR)
+  if (typeof sock.requestPairingCode !== 'function') {
+    await ctx.reply('❌ This Baileys version does not support pairing codes.');
+    try { sock.end(); } catch {}
+    return;
+  }
+
+  try {
+    // Some Baileys versions accept no args; if yours requires a phone number and throws,
+    // catch below and inform the operator.
+    const code = await sock.requestPairingCode();
+
+    await ctx.reply(
+      `📲 Enter this WhatsApp pairing code within 5 minutes:\n\`${code}\``,
+      { parse_mode: 'Markdown' }
+    );
+
+    // Expire the code after 5 minutes
+    expireTimer = setTimeout(() => {
+      if (!paired) {
+        try { sock.end(); } catch {}
+        ctx.reply('⏳ Pairing code expired. Send /pair to generate a new one.');
+      }
+    }, 5 * 60 * 1000);
+
+  } catch (err) {
+    console.error('requestPairingCode failed:', err?.message || err);
+    await ctx.reply('❌ Could not generate pairing code. (If your Baileys build requires a phone number for requestPairingCode, configure it accordingly.)');
+    try { sock.end(); } catch {}
+    return;
+  }
+
+  // Handle connection lifecycle
+  sock.ev.on('connection.update', async (update) => {
+    if (update.connection === 'open' && !paired) {
+      paired = true;
+      clearTimeout(expireTimer);
+
+      await saveCreds();
+
+      // Collect all session files into a single object
+      const sessionData = {};
+      for (const file of await fs.readdir(sessionFolder)) {
+        sessionData[file] = await fs.readFile(path.join(sessionFolder, file), 'utf8');
+      }
+
+      // Encrypt and upload
+      let sessionId = null;
+      try {
+        const encryptedPayload = encryptSessionData(sessionData, ENCRYPTION_SECRET);
+        sessionId = await uploadEncryptedToHastebin(encryptedPayload);
+      } catch (e) {
+        console.error('Encrypt/Upload failed:', e?.message || e);
+      }
+
+      // Send session_id to the user's WhatsApp (self-chat)
+      try {
+        const jid = sock?.user?.id; // your linked account JID
+        if (jid) {
+          if (sessionId) {
+            await sock.sendMessage(jid, { text: `✅ Your encrypted session_id:\n${sessionId}\nKeep it secret. It’s only usable by this bot (server-side decryption).` });
+          } else {
+            await sock.sendMessage(jid, { text: '⚠️ Session saved locally, but failed to upload encrypted session to Hastebin.' });
+          }
+        }
+      } catch (e) {
+        console.error('Failed to DM session_id on WhatsApp:', e?.message || e);
+      }
+
+      // Let the Telegram user know we’re done
+      await ctx.reply('✅ WhatsApp paired successfully! I’ve sent your session_id to your WhatsApp.');
+
+      try { sock.end(); } catch {}
+    }
+
+    if (update.connection === 'close' && !paired) {
+      clearTimeout(expireTimer);
+      await ctx.reply('❌ Connection closed or pairing failed. Please try again with /pair.');
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+});
+
+// Optional: remove the user’s local session
+bot.command('logout', async ctx => {
+  const tgId = ctx.from.id;
+  const sessionFolder = path.join(SESSIONS_DIR, tgId.toString());
+  await fs.remove(sessionFolder);
+  ctx.reply('Your WhatsApp session has been removed.');
+});
+
+// Graceful shutdown
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+bot.launch().then(() => {
+  console.log('Telegram WhatsApp pairing bot running (pairing code only, 5-min expiry, encrypted session upload).');
+});
