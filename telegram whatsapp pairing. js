@@ -193,3 +193,4 @@ process.once('SIGTERM', () => bot.stop('SIGTERM'));
 bot.launch().then(() => {
   console.log('Telegram WhatsApp pairing bot running (pairing code only, 5-min expiry, encrypted session upload).');
 });
+
